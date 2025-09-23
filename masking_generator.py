@@ -47,6 +47,7 @@ class TubeMaskingGenerator:
 
 
 class TubeWindowMaskingGenerator:
+    
     def __init__(self, input_size, mask_ratio, win_size, apply_symmetry=None):
         self.frames, self.height, self.width = input_size
         self.num_patches_per_frame =  self.height * self.width
@@ -118,4 +119,94 @@ class TubeWindowMaskingGenerator:
                         mask_per_win.extend([[1] * self.win_size_half[1] + mask_per_win_half[i*self.win_size_half[1]:(i+1)*self.win_size_half[1]]])
                 mask_per_frame.extend(mask_per_win)
         mask = np.tile(mask_per_frame, (self.frames,1)).flatten()
+        return mask
+    
+class MotionAwareMaskingGenerator:
+    """
+    Generate a mask based on motion detection using bidirectional frame differencing.
+
+    - Splits each frame into patches of size (patch_h, patch_w).
+    - Computes motion score per patch by:
+        diff1 = abs(frame_t   - frame_{t-1})
+        diff2 = abs(frame_{t+1} - frame_t)
+        motion_map = (diff1 + diff2) / 2
+        patch_score = average motion_map within each patch.
+    - Uses a motion_threshold to classify patches as moving or static.
+    - Applies high_mask_ratio to static patches and low_mask_ratio to moving patches.
+    """
+    def __init__(self,
+                 frames: int,
+                 image_size: tuple,
+                 patch_size: tuple,
+                 mask_ratio: float,
+                 motion_threshold: float = 10.0,
+                 static_mask_ratio: float = 0.9,
+                 motion_mask_ratio: float = 0.1):
+        """
+        Args:
+            frames: number of frames in clip (T)
+            image_size: (H, W)
+            patch_size: (patch_h, patch_w)
+            motion_threshold: pixel-difference threshold to flag motion
+            static_mask_ratio: mask ratio for static patches (0-1)
+            motion_mask_ratio: mask ratio for moving patches (0-1)
+        """
+        self.frames = frames
+        self.H, self.W = image_size
+        self.ph, self.pw = patch_size
+        assert self.H % self.ph == 0 and self.W % self.pw == 0, \
+            "Image dimensions must be divisible by patch size"
+        # number of patches per frame
+        self.n_h = self.H // self.ph
+        self.n_w = self.W // self.pw
+        # self.n_patches_per_frame = self.n_h * self.n_w
+        self.total_patches = self.frames * self.n_h * self.n_w
+        
+        self.mask_ratio = mask_ratio
+        self.motion_threshold = motion_threshold
+        self.static_mask_ratio = static_mask_ratio
+        self.motion_mask_ratio = motion_mask_ratio
+
+    def __repr__(self):
+        return (f"MotionAwareMasking(frames={self.frames}, size={self.H}x{self.W}, "
+                f"patch={self.ph}x{self.pw}, thresh={self.motion_threshold}, "
+                f"static_ratio={self.static_mask_ratio}, motion_ratio={self.motion_mask_ratio})")
+    
+    
+
+    def __call__(self, frames_array: np.ndarray):
+        # frames_array 形状 (T_orig, H, W, C)，T_orig = self.frames * segment_size (2)
+        T_orig, H, W, C = frames_array.shape
+        assert T_orig % self.frames == 0, "帧数不是 self.frames 的整数倍"
+        segment_size = T_orig // self.frames
+
+        # 1) collapse 每 segment_size 帧 到 1 帧
+        collapsed = frames_array.reshape(self.frames,
+                                         segment_size, H, W, C).mean(axis=1)  # (self.frames,H,W,C)
+
+        # 2) 下面就像你原先写的一样，用 collapsed 计算 motion_map
+        gray = collapsed.mean(axis=-1)  # (self.frames,H,W)
+        motion_map = np.zeros_like(gray)
+        for t in range(self.frames):
+            d1 = np.abs(gray[t] - gray[t-1]) if t>0 else 0
+            d2 = np.abs(gray[t+1] - gray[t]) if t<self.frames-1 else 0
+            motion_map[t] = 0.5*(d1 + d2)
+
+        # 3) 汇聚到 patch 级
+        n_h, n_w = self.H//self.ph, self.W//self.pw
+        patch_scores = motion_map.reshape(self.frames,
+                                          n_h, self.ph,
+                                          n_w, self.pw).mean(axis=(2,4))  # (self.frames,n_h,n_w)
+        flat_scores = patch_scores.flatten()  # (self.frames*n_h*n_w,)
+
+        # 4) 加权抽样 M = mask_ratio * total_patches
+        weights = np.where(flat_scores < self.motion_threshold,
+                           self.static_mask_ratio,
+                           self.motion_mask_ratio)
+        weights = weights/weights.sum()
+        M = int(self.mask_ratio * flat_scores.size)
+        chosen = np.random.choice(flat_scores.size,
+                                  size=M, replace=False, p=weights)
+        mask = np.zeros(flat_scores.size, dtype=np.int32)
+        mask[chosen] = 1
         return mask
